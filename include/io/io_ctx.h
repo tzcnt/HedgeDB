@@ -22,17 +22,35 @@ using namespace std::string_literals;
 
 namespace hedge::io
 {
-    struct io_callback
+    // When an aw_io is initiated via the ASYNC_INITIATE path (fork(),
+    // spawn_many(), detach(), ...) the originating aw_io is destroyed as soon
+    // as async_initiate() returns. The customizer and io_request therefore
+    // cannot live in the aw_io; they are relocated into this heap block, which
+    // the owning io_callback frees on completion (or on io_ctx teardown).
+    struct owned_io_state
     {
         tmc::detail::awaitable_customizer<int32_t> customizer;
+        std::unique_ptr<io_request> request;
+    };
+
+    struct io_callback
+    {
+        tmc::detail::awaitable_customizer<int32_t>* customizer;
         io_request* req;
+        // Non-null only on the ASYNC_INITIATE path. Owns the customizer and
+        // io_request pointed to above. Null when awaited directly, where those
+        // live in the (still-suspended) awaiting coroutine's frame. Because the
+        // state is held behind this heap indirection, moving the io_callback
+        // between the waiting/in-flight containers never invalidates the
+        // customizer/req pointers.
+        std::unique_ptr<owned_io_state> owned;
 
         std::coroutine_handle<> resume(int32_t result)
         {
             req->res = result;
-            *customizer.result_ptr = result;
+            *customizer->result_ptr = result;
 
-            return customizer.resume_continuation();
+            return customizer->resume_continuation();
         }
 
         void prepare(io_uring_sqe* sqe) const
@@ -148,7 +166,7 @@ namespace hedge::io
 
                 for(size_t i = 0; i < pop_count; ++i)
                 {
-                    auto io_callback = this->_waiting_for_io.front();
+                    auto io_callback = std::move(this->_waiting_for_io.front());
                     this->_waiting_for_io.pop_front();
 
                     io_uring_sqe* sqe = io_uring_get_sqe(&this->_uring);
@@ -156,7 +174,7 @@ namespace hedge::io
                     uint64_t this_req_id = this->_req_id++;
                     io_uring_sqe_set_data64(sqe, this_req_id);
 
-                    this->_in_flight.emplace(this_req_id, io_callback);
+                    this->_in_flight.emplace(this_req_id, std::move(io_callback));
                 }
             }
 
@@ -172,7 +190,7 @@ namespace hedge::io
 
         void submit_request(io_callback req)
         {
-            this->_waiting_for_io.emplace_back(req);
+            this->_waiting_for_io.emplace_back(std::move(req));
 
             if(this->_waiting_for_io.size() == this->_queue_depth)
                 this->submit_and_wait();
@@ -191,13 +209,35 @@ namespace hedge::io
         friend tmc::detail::awaitable_traits<aw_io>;
 
     private:
-        void _initiate()
+        // Direct co_await: the io_callback borrows the customizer and
+        // io_request, which stay alive in this awaiter's coroutine frame (which
+        // remains suspended) until the operation completes.
+        void _submit_borrowed()
         {
             auto* this_thread_uring = io_ctx::this_thread_ctx;
             assert(this_thread_uring != nullptr);
             this_thread_uring->submit_request(io_callback{
-                .customizer = this->customizer,
-                .req = this->_request.get()});
+                .customizer = &this->customizer,
+                .req = this->_request.get(),
+                .owned = nullptr});
+        }
+
+        // ASYNC_INITIATE (fork/spawn_many/detach): this awaitable is destroyed
+        // as soon as initiation returns, so move the already-configured
+        // customizer and io_request into a heap block owned by the io_callback.
+        void _submit_owned()
+        {
+            auto* this_thread_uring = io_ctx::this_thread_ctx;
+            assert(this_thread_uring != nullptr);
+            auto owned = std::make_unique<owned_io_state>();
+            owned->customizer = this->customizer;
+            owned->request = std::move(this->_request);
+            auto* customizer_ptr = &owned->customizer;
+            io_request* req_ptr = owned->request.get();
+            this_thread_uring->submit_request(io_callback{
+                .customizer = customizer_ptr,
+                .req = req_ptr,
+                .owned = std::move(owned)});
         }
 
         tmc::detail::awaitable_customizer<int32_t> customizer;
@@ -220,7 +260,7 @@ namespace hedge::io
         {
             customizer.continuation = Outer.address();
             customizer.result_ptr = &this->_request->res;
-            this->_initiate();
+            this->_submit_borrowed();
         }
 
         [[nodiscard]] TMC_AWAIT_RESUME int32_t await_resume() const
@@ -251,7 +291,7 @@ struct tmc::detail::awaitable_traits<hedge::io::aw_io>
         hedge::io::aw_io&& awaitable, [[maybe_unused]] tmc::ex_any* Executor,
         [[maybe_unused]] size_t Priority)
     {
-        awaitable._initiate();
+        awaitable._submit_owned();
     }
 
     static void
